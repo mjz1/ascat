@@ -11,6 +11,9 @@
 #' @param selectAlg Set to "exact" to run the exact algorithm, or "fast" to run the heuristic algorithm. (Default = "exact")
 #' @param refine Logical. Should breakpoints be refined on a per sample base? Otherwise each breakpoint is assumed to be present in each sample. (Default = TRUE)
 #' @param seed A seed to be set when subsampling SNPs for X in males (optional, default=as.integer(Sys.time())).
+#' @param flip_baf logical. Whether to flip baf values. Set to FALSE for phased data
+#' @param winsorize Whether to winsorize outliers or not
+#' @param min_bins minimum number of bins to proceed with segmentation
 #' 
 #' @details This function saves the results in in [sample].LogR.PCFed.txt and [sample].BAF.PCFed.txt
 #' 
@@ -27,7 +30,7 @@
 #' 
 #' @export
 #'
-ascat.asmultipcf <- function(ASCATobj, ascat.gg = NULL, penalty = 70, out.dir = ".", wsample=NULL, selectAlg="exact",refine=TRUE, seed=as.integer(Sys.time())) {
+ascat.asmultipcf <- function(ASCATobj, ascat.gg = NULL, penalty = 70, out.dir = ".", wsample=NULL, selectAlg="exact",refine=TRUE, seed=as.integer(Sys.time()), flip_baf = TRUE, winsorize = TRUE, min_bins = 6) {
   set.seed(seed)
   useLogRonlySites=TRUE
   #first, set germline genotypes
@@ -107,11 +110,21 @@ ascat.asmultipcf <- function(ASCATobj, ascat.gg = NULL, penalty = 70, out.dir = 
       bafnames= c(bafnames,names(indices_bafOutput))
       if (length(indices)!=0) {
         ## mirror baf so that areas with allelic imbalance have only one band
-        bafselmirrored <- mirrorBafMatrix(bafsel)
+        if (flip_baf) {
+          bafselmirrored <- mirrorBafMatrix(bafsel)
+        } else {
+          bafselmirrored <- bafsel
+        }
         
         ## winsorize lr and baf to remove outliers on a per sample base
-        lrwins <- madWinsMatrixWithNA(lr,tau=2.5,k=25)
-        bafwins <- mirrorBafMatrix(madWinsMatrixWithNA(bafselmirrored,tau=2.5,k=25))
+        if (winsorize) {
+          lrwins <- madWinsMatrixWithNA(lr,tau=2.5,k=25)
+          bafwins <- mirrorBafMatrix(madWinsMatrixWithNA(bafselmirrored,tau=2.5,k=25))
+        } else {
+          lrwins <- lr
+          bafwins <- bafselmirrored
+        }
+
         
         ## average logR values around each selected het site
         logRaveraged = NULL;
@@ -143,13 +156,18 @@ ascat.asmultipcf <- function(ASCATobj, ascat.gg = NULL, penalty = 70, out.dir = 
         reps = nrow(lr)
         logRPCFed = rbind(logRPCFed,t(as.matrix(level))[rep(1,reps),])
       } else {
-        if(nrow(logRaveraged)<6) {
+        # Here if there are less than 6 bins it will simply take the average
+        if(nrow(logRaveraged)<min_bins) {
           if (nrow(logRaveraged)==1) {
             logRASPCF = logRaveraged
             bafASPCF = bafwins
           } else {
             logRASPCF = apply(logRaveraged,2,function(x) rep(mean(x,na.rm=TRUE),length(x)))
-            bafASPCF = apply(bafwins,2,function(x) rep(ifelse(mean(x,na.rm=TRUE)>=0.5,mean(x,na.rm=TRUE),1-mean(x,na.rm=TRUE)),length(x)))
+            if (flip_baf) {
+             bafASPCF = apply(bafwins,2,function(x) rep(ifelse(mean(x,na.rm=TRUE)>=0.5,mean(x,na.rm=TRUE),1-mean(x,na.rm=TRUE)),length(x)))
+            } else {
+              bafASPCF = apply(bafwins,2,function(x) rep(mean(x,na.rm=TRUE),length(x)))        
+            }
           }
         } else {
           # combine logR and BAF data into one matrix for joint segmentation
@@ -215,46 +233,55 @@ ascat.asmultipcf <- function(ASCATobj, ascat.gg = NULL, penalty = 70, out.dir = 
           bafASPCF <- bafASPCF[Select_sites2, ,drop=FALSE]
         } 
         
+        # We skip this when not flipping baf == not sure exactly what it does
         if (nrow(bafASPCF)>0) {
-          ## correct baf estimate of balanced streches which is skewed due to mirroring (part of fastAspcf in single sample algorithm)
           bafPCFed_s = matrix(nrow=nrow(bafASPCF),ncol=ncol(bafASPCF))
-          for (sample in 1:ncol(bafASPCF)) {
-            
-            ## calculate location of breakpoints
-            breakpts <- c(0,cumsum(rle(bafASPCF[,sample])$lengths))
-            
-            # On each segment calculate mean of unflipped B allele data
-            frst <- breakpts[1:(length(breakpts)-1)] + 1
-            nseg = length(frst)
-            last <- breakpts[2:length(breakpts)]
-            
-            ## get median absolute deviation from running median of baf
-            sd <- getMadwithNA(bafwins[!(homo|is.na(homo))[indices],sample])
-            
-            yhat <- rep(NA,nrow(bafASPCF))
-            
-            for (i in 1:nseg) {
-              yi <- bafASPCF[frst[i]:last[i],sample]
+          if (flip_baf) {
+            ## correct baf estimate of balanced streches which is skewed due to mirroring (part of fastAspcf in single sample algorithm)
+            for (sample in 1:ncol(bafASPCF)) {
               
-              if (!all(is.na(yi))) {
+              ## calculate location of breakpoints
+              breakpts <- c(0,cumsum(rle(bafASPCF[,sample])$lengths))
+              
+              # On each segment calculate mean of unflipped B allele data
+              frst <- breakpts[1:(length(breakpts)-1)] + 1
+              nseg = length(frst)
+              last <- breakpts[2:length(breakpts)]
+              
+              ## get median absolute deviation from running median of baf
+              sd <- getMadwithNA(bafwins[!(homo|is.na(homo))[indices],sample])
+              
+              yhat <- rep(NA,nrow(bafASPCF))
+              
+              for (i in 1:nseg) {
+                yi <- bafASPCF[frst[i]:last[i],sample]
                 
-                # Center data around zero (by subtracting 0.5) and estimate mean
-                if(length(yi)== 0){
-                  mu <- 0
-                }else{
-                  mu <- mean(abs(yi-0.5),na.rm = TRUE)
+                if (!all(is.na(yi))) {
+                  
+                  # Center data around zero (by subtracting 0.5) and estimate mean
+                  if(length(yi)== 0){
+                    mu <- 0
+                  }else{
+                    mu <- mean(abs(yi-0.5),na.rm = TRUE)
+                  }
+                  
+                  # Make a (slightly arbitrary) decision concerning branches
+                  # This may be improved by a test of equal variances
+                  if(sqrt(sd^2+mu^2) < 2*sd){
+                    mu <- 0
+                  }
+                  yhat[frst[i]:last[i]] <- rep(mu+0.5,last[i]-frst[i]+1)
                 }
-                
-                # Make a (slightly arbitrary) decision concerning branches
-                # This may be improved by a test of equal variances
-                if(sqrt(sd^2+mu^2) < 2*sd){
-                  mu <- 0
-                }
-                yhat[frst[i]:last[i]] <- rep(mu+0.5,last[i]-frst[i]+1)
               }
+              bafPCFed_s[,sample] = yhat
+            } ## end baf correction
+          } else {
+            bafPCFed_s <- bafASPCF
+            if (nrow(bafPCFed_s) == 1) {
+              bafPCFed_s <- t(matrix(bafASPCF))
             }
-            bafPCFed_s[,sample] = yhat
-          } ## end baf correction
+            # colnames(bafPCFed_s) <- colnames(bafPCFed)
+          }
           bafPCFed = rbind(bafPCFed,bafPCFed_s)
         }
         
@@ -335,25 +362,34 @@ ascat.asmultipcf <- function(ASCATobj, ascat.gg = NULL, penalty = 70, out.dir = 
     }
   } ## end for segmentlength in segmentlengths
   
+  # hotfix for weird list structure
+  if (!flip_baf) {
+    save_rownames <- rownames(bafPCFed)
+    bafPCFed <- matrix(unlist(bafPCFed), ncol = ncol(bafPCFed))
+    rownames(bafPCFed) <- save_rownames
+  }
+  
   # add column names and write results to files
   colnames(logRPCFed) = colnames(ASCATobj$Tumor_LogR)
   colnames(bafPCFed) = colnames(ASCATobj$Tumor_LogR)
-  Tumor_BAF_segmented <- list()
+  # Tumor_BAF_segmented <- list()
   
-  for (sample in 1:length(ASCATobj$samples)) { 
-    logrfilename = paste(out.dir,'/',ASCATobj$samples[sample],".LogR.PCFed.txt",sep="")
-    baffilename = paste(out.dir,'/',ASCATobj$samples[sample],".BAF.PCFed.txt",sep="")
-    
-    ## remove NAs from BAF data
-    bafPCFed_sample <- bafPCFed[!is.na(bafPCFed[,sample]),sample,drop=FALSE]
-    Tumor_BAF_segmented[[sample]] <- 1-bafPCFed_sample
-    
-    if (!is.na(out.dir)) write.table(logRPCFed[,sample],logrfilename,sep="\t",col.names=F,quote=F)
-    if (!is.na(out.dir)) write.table(bafPCFed_sample,baffilename,sep="\t",col.names=F,quote=F)
-  }
+  # for (sample in 1:length(ASCATobj$samples)) { 
+  #   logrfilename = paste(out.dir,'/',ASCATobj$samples[sample],".LogR.PCFed.txt",sep="")
+  #   baffilename = paste(out.dir,'/',ASCATobj$samples[sample],".BAF.PCFed.txt",sep="")
+  #   
+  #   ## remove NAs from BAF data
+  #   # bafPCFed_sample <- bafPCFed[!is.na(bafPCFed[,sample]),sample,drop=FALSE]
+  #   # Tumor_BAF_segmented[[sample]] <- 1-bafPCFed_sample
+  #   # Tumor_BAF_segmented[[sample]] <- bafPCFed[,sample]
+  # 
+  #   # if (!is.na(out.dir)) write.table(logRPCFed[,sample],logrfilename,sep="\t",col.names=F,quote=F)
+  #   if (!is.na(out.dir)) write.table(bafPCFed_sample,baffilename,sep="\t",col.names=F,quote=F)
+  # }
   
   ASCATobj$Tumor_LogR_segmented=logRPCFed
-  ASCATobj$Tumor_BAF_segmented=Tumor_BAF_segmented
+  colnames(bafPCFed) <- colnames(logRPCFed)
+  ASCATobj$Tumor_BAF_segmented=bafPCFed
   ASCATobj$failedarrays=ascat.gg$failedarrays
   return(ASCATobj)
 
