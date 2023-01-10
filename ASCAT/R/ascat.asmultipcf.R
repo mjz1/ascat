@@ -73,6 +73,15 @@ ascat.asmultipcf <- function(ASCATobj, ascat.gg = NULL, penalty = 70, out.dir = 
       ## extract logR as well as tumor and normal baf of a segmentable chromosome arm (chrke)
       lr = ASCATobj$Tumor_LogR[ASCATobj$chr[[chrke]],]
       baf = ASCATobj$Tumor_BAF[ASCATobj$chr[[chrke]],]
+
+      # Fix for single bins
+      if (is.null(nrow(lr))) {
+        lr <-t(as.matrix(lr))
+      }
+      if (is.null(nrow(baf))) {
+        baf <-t(as.matrix(baf))
+      }
+
       homo = gg[ASCATobj$chr[[chrke]]]
       
       ## set baf of homozygous sites to missing
